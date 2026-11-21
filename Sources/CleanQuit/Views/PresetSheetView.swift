@@ -2,22 +2,26 @@ import SwiftUI
 
 struct PresetSheetView: View {
     @Binding var presetName: String
-    let selectedCount: Int
+    let mode: CleanupMode
+    let targetCount: Int
     let onSave: () -> Void
     let onCancel: () -> Void
 
     var body: some View {
         HStack(spacing: 6) {
-            TextField("预设名称（如：下班清理）", text: $presetName)
-                .textFieldStyle(.roundedBorder)
-                .font(.caption)
-                .onSubmit {
-                    if !presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        onSave()
-                    }
+            TextField(
+                mode == .keepSelected ? "预设名称（如 论文学习）" : "预设名称（如 下班清理）",
+                text: $presetName
+            )
+            .textFieldStyle(.roundedBorder)
+            .font(.caption)
+            .onSubmit {
+                if !presetName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    onSave()
                 }
+            }
 
-            Button("保存(\(selectedCount))") {
+            Button("保存(\(targetCount))") {
                 onSave()
             }
             .buttonStyle(.borderedProminent)
