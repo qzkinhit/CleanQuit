@@ -43,6 +43,11 @@ struct MenuBarContentView: View {
         VStack(spacing: 9) {
             headerBar
             memoryCard
+
+            if viewModel.isPlanningSpeedUp || viewModel.speedUpPlan != nil {
+                speedUpSection
+            }
+
             modeBar
 
             if showingSavePreset {
@@ -138,6 +143,16 @@ struct MenuBarContentView: View {
                     .font(.caption.weight(.semibold))
 
                 Spacer()
+
+                Button {
+                    viewModel.planSpeedUp()
+                } label: {
+                    Label(viewModel.isPlanningSpeedUp ? "检测中" : "一键加速", systemImage: "bolt.fill")
+                        .font(.caption2.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .disabled(viewModel.isPlanningSpeedUp || viewModel.isRunningSpeedUp)
+                .help("检测 2 秒，只回收没有主人且空闲的后台进程，正在使用的应用不动")
 
                 Text(snap.pressureLevel.label)
                     .font(.caption2.weight(.semibold))
@@ -336,6 +351,91 @@ struct MenuBarContentView: View {
         .frame(height: 196)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var speedUpSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if viewModel.isPlanningSpeedUp {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("正在检测进程活动（\(Int(CleanerViewModel.speedUpSampleSeconds)) 秒）…")
+                        .font(.caption)
+                }
+            } else if let plan = viewModel.speedUpPlan {
+                let chosen = viewModel.selectedSpeedUpItems
+                let chosenBytes = chosen.reduce(UInt64(0)) { $0 + $1.memoryBytes }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "bolt.fill").foregroundStyle(.yellow)
+                    Text(plan.items.isEmpty ? "没有可安全回收的进程" : "加速方案 · 可回收 \(plan.items.count) 项")
+                        .font(.caption.weight(.semibold))
+                    Spacer()
+                    if chosenBytes > 0 {
+                        Text("已选 \(MemoryFormatter.string(fromBytes: chosenBytes))")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                ForEach(plan.items) { item in
+                    let checked = viewModel.selectedSpeedUpIDs.contains(item.id)
+                    HStack(spacing: 7) {
+                        Button {
+                            viewModel.toggleSpeedUpItem(item)
+                        } label: {
+                            Image(systemName: checked ? "checkmark.square.fill" : "square")
+                                .foregroundStyle(checked ? Color.orange : .secondary)
+                        }
+                        .buttonStyle(.borderless)
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 4) {
+                                Text(item.title).font(.caption).lineLimit(1)
+                                Text(item.kind.badgeText)
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .background(Color.secondary.opacity(0.15))
+                                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                            }
+                            Text(item.detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                        Spacer()
+                        Text(item.formattedMemory)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if !plan.protectedApps.isEmpty {
+                    let names = plan.protectedApps.prefix(6)
+                        .map { "\($0.name)（\($0.reason)）" }
+                        .joined(separator: "、")
+                    Text("不会动：" + names + (plan.protectedApps.count > 6 ? " 等 \(plan.protectedApps.count) 个" : ""))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                HStack {
+                    Button("取消") { viewModel.cancelSpeedUp() }
+                        .buttonStyle(.borderless)
+                    Spacer()
+                    Button(viewModel.isRunningSpeedUp ? "正在加速…" : "执行加速（\(chosen.count) 项）") {
+                        viewModel.runSpeedUp()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(chosen.isEmpty || viewModel.isRunningSpeedUp)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.yellow.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 7))
     }
 
     private var deepReclaimSection: some View {

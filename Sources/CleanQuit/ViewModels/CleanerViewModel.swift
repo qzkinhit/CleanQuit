@@ -93,8 +93,17 @@ final class CleanerViewModel: ObservableObject {
     @Published var showAutomationPermissionHelp: Bool = false
     @Published var launchAtLogin: Bool = false
     @Published var isCleaning: Bool = false
+    @Published var speedUpPlan: SpeedUpPlan?
+    @Published var selectedSpeedUpIDs: Set<String> = []
+    @Published var isPlanningSpeedUp: Bool = false
+    @Published var isRunningSpeedUp: Bool = false
 
     private let appCleaner: AppCleanerService
+    private let speedUpService = SpeedUpService()
+    /// When each app last came to the front while CleanQuit was running.
+    private var lastActivation: [pid_t: Date] = [:]
+    static let recentUseWindow: TimeInterval = 10 * 60
+    static let speedUpSampleSeconds: Double = 2.0
     private let finderService: FinderService
     private let hotkeyService: GlobalHotkeyService
     private let memoryService: SystemMemoryService
@@ -730,6 +739,126 @@ final class CleanerViewModel: ObservableObject {
                 self?.refreshApps()
             }
             .store(in: &cancellables)
+
+        nc.publisher(for: NSWorkspace.didActivateApplicationNotification)
+            .compactMap { ($0.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier }
+            .sink { [weak self] pid in
+                self?.lastActivation[pid] = Date()
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: - Speed up
+
+    var selectedSpeedUpItems: [SpeedUpItem] {
+        speedUpPlan?.items.filter { selectedSpeedUpIDs.contains($0.id) } ?? []
+    }
+
+    func toggleSpeedUpItem(_ item: SpeedUpItem) {
+        if selectedSpeedUpIDs.contains(item.id) {
+            selectedSpeedUpIDs.remove(item.id)
+        } else {
+            selectedSpeedUpIDs.insert(item.id)
+        }
+    }
+
+    func cancelSpeedUp() {
+        speedUpPlan = nil
+        selectedSpeedUpIDs = []
+    }
+
+    /// Samples processes for a couple of seconds and proposes what can be stopped without touching work in progress.
+    func planSpeedUp() {
+        guard !isPlanningSpeedUp, !isRunningSpeedUp else { return }
+        refreshApps()
+        isPlanningSpeedUp = true
+        speedUpPlan = nil
+        statusMessage = nil
+
+        let selfPID = getpid()
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let now = Date()
+        let inputs = runningApps.map { app in
+            SpeedUpAppInput(
+                item: app,
+                isEssential: isEssential(app),
+                isKept: cleanupMode == .keepSelected && keptAppKeys.contains(app.persistenceKey),
+                isFrontmost: app.pid == frontmost && app.pid != selfPID,
+                usedRecently: (lastActivation[app.pid].map { now.timeIntervalSince($0) < Self.recentUseWindow }) ?? false
+            )
+        }
+        let residual = reclaimableGroups
+        let seconds = Self.speedUpSampleSeconds
+        let service = speedUpService
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let sample = service.sample(seconds: seconds)
+            let plan = SpeedUpPlanner.makePlan(
+                before: sample.before, after: sample.after, arguments: sample.arguments,
+                seconds: seconds, apps: inputs, residualGroups: residual
+            )
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.speedUpPlan = plan
+                self.selectedSpeedUpIDs = plan.preselectedIDs
+                self.isPlanningSpeedUp = false
+                if plan.items.isEmpty {
+                    self.statusMessage = "没有发现可以安全回收的进程，\(plan.protectedApps.count) 个应用正在使用中，未做改动"
+                }
+            }
+        }
+    }
+
+    /// Stops the ticked items. Apps that came to the front after the check are skipped.
+    func runSpeedUp() {
+        guard let plan = speedUpPlan, !isRunningSpeedUp else { return }
+        let chosen = plan.items.filter { selectedSpeedUpIDs.contains($0.id) }
+        guard !chosen.isEmpty else { return }
+        isRunningSpeedUp = true
+        let before = memoryService.captureSnapshot()
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let checkedAt = Date().addingTimeInterval(-Self.speedUpSampleSeconds - 60)
+
+        var skipped: [String] = []
+        let appItems: [AppItem] = chosen.compactMap { entry in
+            guard let pid = entry.appPID, let app = runningApps.first(where: { $0.pid == pid }) else { return nil }
+            if pid == frontmost || (lastActivation[pid].map { $0 > checkedAt } ?? false) {
+                skipped.append(app.name)
+                return nil
+            }
+            return app
+        }
+        let processSets = chosen.filter { $0.appPID == nil }.map(\.processes)
+        let appResult = appItems.isEmpty ? nil : appCleaner.quitApps(appItems, force: false)
+        let service = speedUpService
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var stopped = 0
+            for processes in processSets {
+                stopped += service.stop(processes)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                guard let self else { return }
+                let swept = appItems.isEmpty ? 0 : self.appCleaner.sweepResidualsAfterQuit(apps: appItems, force: false)
+                self.refreshApps()
+                let after = self.memorySnapshot
+                let usedDrop = before.usedBytes > after.usedBytes ? before.usedBytes - after.usedBytes : 0
+                let swapDrop = before.swapUsedBytes > after.swapUsedBytes ? before.swapUsedBytes - after.swapUsedBytes : 0
+
+                var parts: [String] = []
+                if stopped > 0 { parts.append("回收 \(stopped) 个无主或闲置进程") }
+                if let r = appResult, r.terminatedCount > 0 { parts.append("退出 \(r.terminatedCount) 个闲置应用") }
+                if swept > 0 { parts.append("清扫 \(swept) 个附属残留") }
+                if !skipped.isEmpty { parts.append("跳过刚用过的 " + skipped.joined(separator: "、")) }
+                if usedDrop + swapDrop >= 10 * 1_048_576 {
+                    parts.append("内存与交换区共减少 \(MemoryFormatter.string(fromBytes: usedDrop + swapDrop))")
+                }
+                self.statusMessage = parts.isEmpty ? "加速完成，没有进程需要处理" : "加速完成：" + parts.joined(separator: " · ")
+                self.speedUpPlan = nil
+                self.selectedSpeedUpIDs = []
+                self.isRunningSpeedUp = false
+            }
+        }
     }
 
     private func syncHotkeyRegistration() {

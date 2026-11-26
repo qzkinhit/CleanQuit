@@ -42,6 +42,10 @@ struct ProcessNode {
     let executablePath: String
     let footprintBytes: UInt64
     let rootAppBundlePath: String?
+    /// User plus system CPU time used so far, in nanoseconds.
+    var cpuNanos: UInt64 = 0
+    /// Process start time, seconds since 1970.
+    var startSeconds: UInt64 = 0
 }
 
 struct ProcessSnapshotAnalysis {
@@ -193,6 +197,29 @@ final class ProcessAnalyzerService {
         return terminatePIDs(Array(targets), force: force)
     }
 
+    /// Command line of a process (arguments after the executable path), or "" when unreadable.
+    static func arguments(of pid: pid_t) -> String {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return "" }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return "" }
+        let argc = Int(buffer.withUnsafeBytes { $0.load(as: Int32.self) })
+        var index = MemoryLayout<Int32>.size
+        while index < size && buffer[index] != 0 { index += 1 }   // executable path
+        while index < size && buffer[index] == 0 { index += 1 }
+        var args: [String] = []
+        var start = index
+        while index < size && args.count < argc {
+            if buffer[index] == 0 {
+                args.append(String(decoding: buffer[start..<index], as: UTF8.self))
+                start = index + 1
+            }
+            index += 1
+        }
+        return args.joined(separator: " ")
+    }
+
     func activeExecutablePaths() -> [String] {
         collectUserProcessNodes(uid: getuid()).values.map(\.executablePath).filter { !$0.isEmpty }
     }
@@ -210,7 +237,12 @@ final class ProcessAnalyzerService {
             if isSystemOrProtectedPath(node.executablePath) || protectedProcessNames.contains(node.name) {
                 continue
             }
-            if let rootBundle = node.rootAppBundlePath, !activeBundlePaths.contains(rootBundle) {
+            // App extensions (.appex) are started on demand by the system, for Finder or share menus.
+            if node.executablePath.contains(".appex/") {
+                continue
+            }
+            if let rootBundle = node.rootAppBundlePath, !activeBundlePaths.contains(rootBundle),
+               Self.isResidualAppBundle(rootBundle) {
                 orphanBuckets[rootBundle, default: []].append(node)
             }
         }
@@ -295,7 +327,14 @@ final class ProcessAnalyzerService {
         return false
     }
 
-    private func collectUserProcessNodes(uid: uid_t) -> [pid_t: ProcessNode] {
+    /// rusage CPU times are in Mach absolute time units on Apple silicon.
+    private static let timebase: (numer: UInt64, denom: UInt64) = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return (UInt64(max(info.numer, 1)), UInt64(max(info.denom, 1)))
+    }()
+
+    func collectUserProcessNodes(uid: uid_t) -> [pid_t: ProcessNode] {
         let estimated = proc_listallpids(nil, 0)
         guard estimated > 0 else { return [:] }
 
@@ -331,6 +370,7 @@ final class ProcessAnalyzerService {
             }
 
             var footprint: UInt64 = 0
+            var cpuNanos: UInt64 = 0
             var rusage = rusage_info_v4()
             let rusageStatus = withUnsafeMutablePointer(to: &rusage) {
                 $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rusagePtr in
@@ -339,6 +379,8 @@ final class ProcessAnalyzerService {
             }
             if rusageStatus == 0 {
                 footprint = rusage.ri_phys_footprint
+                let ticks = rusage.ri_user_time &+ rusage.ri_system_time
+                cpuNanos = ticks.multipliedReportingOverflow(by: Self.timebase.numer).partialValue / Self.timebase.denom
             } else {
                 var taskInfo = proc_taskinfo()
                 let taskSize = Int32(MemoryLayout<proc_taskinfo>.size)
@@ -354,11 +396,20 @@ final class ProcessAnalyzerService {
                 name: procName,
                 executablePath: execPath,
                 footprintBytes: footprint,
-                rootAppBundlePath: Self.extractRootAppBundlePath(from: execPath)
+                rootAppBundlePath: Self.extractRootAppBundlePath(from: execPath),
+                cpuNanos: cpuNanos,
+                startSeconds: UInt64(bsdInfo.pbi_start_tvsec)
             )
         }
 
         return nodes
+    }
+
+    /// Only apps installed in /Applications or ~/Applications can leave residual services.
+    /// Interpreters and frameworks that ship as .app folders (Homebrew's Python.app, for example)
+    /// run scripts and agents and are never treated as leftovers.
+    static func isResidualAppBundle(_ bundlePath: String) -> Bool {
+        AppCleanerService.isTopLevelThirdPartyAppBundle(bundlePath)
     }
 
     static func extractRootAppBundlePath(from executablePath: String) -> String? {
